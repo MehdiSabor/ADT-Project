@@ -15,52 +15,49 @@ class KMeansAlternate:
     def compute_distance(self, point, centroid):
         return np.sqrt(np.sum((point - centroid) ** 2))
 
+    # Squared Distances To All Centroids
+    def compute_squared_distances(self, data):
+        diffs = data[:, np.newaxis, :] - self.centroids[np.newaxis, :, :]
+        return np.sum(diffs ** 2, axis=2)
+
     # Assign ALL points once before the loop
     def initial_assignment(self, data):
-        labels = []
-        for point in data:
-            distances = [self.compute_distance(point, c) 
-                        for c in self.centroids]
-            labels.append(np.argmin(distances))
-        return np.array(labels)
+        squared_distances = self.compute_squared_distances(data)
+        return np.argmin(squared_distances, axis=1)
 
     # Update centroids
     def update_centroids(self, data):
-        new_centroids = []
-        for i in range(self.k):
-            cluster_points = data[self.labels == i]
-            if len(cluster_points) == 0:
-                # If cluster is empty keep old centroid
-                new_centroids.append(self.centroids[i])
-            else:
-                new_centroids.append(cluster_points.mean(axis=0))
-        return np.array(new_centroids)
+        new_centroids = self.centroids.copy()
+        counts = np.bincount(self.labels, minlength=self.k)
+        non_empty = counts > 0
+
+        sums = np.zeros_like(self.centroids)
+        np.add.at(sums, self.labels, data)
+        new_centroids[non_empty] = sums[non_empty] / counts[non_empty, np.newaxis]
+
+        return new_centroids
 
     #  Find furthest point in each cluster 
     def find_furthest_point(self, data, cluster_index):
         cluster_points_idx = np.where(self.labels == cluster_index)[0]
-        max_dist = -1
-        furthest_idx = None
-        for idx in cluster_points_idx:
-            dist = self.compute_distance(
-                data[idx], self.centroids[cluster_index]
-            )
-            if dist > max_dist:
-                max_dist = dist
-                furthest_idx = idx
-        return furthest_idx
+        if len(cluster_points_idx) == 0:
+            return None
+
+        cluster_points = data[cluster_points_idx]
+        diffs = cluster_points - self.centroids[cluster_index]
+        squared_distances = np.sum(diffs ** 2, axis=1)
+        return int(cluster_points_idx[np.argmax(squared_distances)])
 
     # Compute SSE
     def compute_sse(self, data):
-        sse = 0
-        for i in range(self.k):
-            cluster_points = data[self.labels == i]
-            for point in cluster_points:
-                sse += self.compute_distance(point, self.centroids[i]) ** 2
-        return sse
+        assigned_centroids = self.centroids[self.labels]
+        diffs = data - assigned_centroids
+        return float(np.sum(diffs ** 2))
 
     #  Main Fit Function 
     def fit(self, data):
+        data = np.asarray(data, dtype=float)
+
         # Random initialization
         random_indices = np.random.choice(len(data), self.k, replace=False)
         self.centroids = data[random_indices]
@@ -82,9 +79,9 @@ class KMeansAlternate:
 
                 # Check if furthest point is closer to another centroid
                 point = data[furthest_idx]
-                distances = [self.compute_distance(point, c) 
-                            for c in self.centroids]
-                best_cluster = np.argmin(distances)
+                diffs = self.centroids - point
+                squared_distances = np.sum(diffs ** 2, axis=1)
+                best_cluster = int(np.argmin(squared_distances))
 
                 if best_cluster != cluster_idx:
                     self.labels[furthest_idx] = best_cluster

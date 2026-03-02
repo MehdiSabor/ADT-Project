@@ -2,14 +2,26 @@ import numpy as np
 
 
 class KMeansCustom:
-
-    def __init__(self, k, max_iterations=100, epsilon=1e-4):
+    def __init__(
+        self,
+        k,
+        max_iterations=100,
+        epsilon=1e-4,
+        low_percentile=5,
+        high_percentile=95
+    ):
         self.k = k
         self.max_iterations = max_iterations
-        self.epsilon = epsilon          # drift threshold for convergence
+        self.epsilon = epsilon
+
+        # Percentile-based initialization
+        self.low_percentile = low_percentile
+        self.high_percentile = high_percentile
+
         self.centroids = None
         self.labels = None
         self.sse_history = []
+        self.drift_history = []
         self.reassigned_history = []
         self.n_iterations = 0
 
@@ -17,157 +29,104 @@ class KMeansCustom:
     def compute_distance(self, point, centroid):
         return np.sqrt(np.sum((point - centroid) ** 2))
 
-    # ─── ESPI Initialization (Range-Based) ───────────────
-    # Instead of sorting data points and taking partition means,
-    # we divide the actual value range [min, max] of the dominant
-    # dimension into k equal segments and place each centroid at
-    # the midpoint of its segment.
-    # For all other dimensions, centroids are placed at the global mean.
-    # This guarantees:
-    #   - Maximum spread along the most informative axis
-    #   - No two centroids can start at the same position
-    #   - O(n*d) time — no sorting needed
-    def espi_init(self, data):
-        n, d = data.shape
+    # ─── Squared Distances To All Centroids ───────────────
+    def compute_squared_distances(self, data):
+        diffs = data[:, np.newaxis, :] - self.centroids[np.newaxis, :, :]
+        return np.sum(diffs ** 2, axis=2)
 
-        # Step 1: find dominant dimension (largest variance)
+    # ─── Percentile Initialization Across All Features ───
+    def percentile_init(self, data):
         variances = np.var(data, axis=0)
-        dominant_dim = np.argmax(variances)
+        dominant_dim = int(np.argmax(variances))
 
-        # Step 2: get range along dominant dimension
-        d_min = data[:, dominant_dim].min()
-        d_max = data[:, dominant_dim].max()
-        segment_width = (d_max - d_min) / self.k
+        base_centroid = np.mean(data, axis=0)
+        low = np.percentile(data[:, dominant_dim], self.low_percentile)
+        high = np.percentile(data[:, dominant_dim], self.high_percentile)
 
-        # Step 3: global mean for all non-dominant dimensions
-        global_mean = data.mean(axis=0)
-
-        # Step 4: place each centroid at midpoint of its segment
-        # on the dominant axis, global mean on all other axes
-        centroids = []
+        centroids = np.tile(base_centroid, (self.k, 1))
         for j in range(self.k):
-            centroid = global_mean.copy()
-            centroid[dominant_dim] = d_min + (j + 0.5) * segment_width
-            centroids.append(centroid)
+            t = (j + 0.5) / self.k
+            centroids[j, dominant_dim] = low + t * (high - low)
 
-        return np.array(centroids)
+        return centroids
 
-    # ─── Initial Full Assignment ──────────────────────────
+    # ─── Full Assignment ──────────────────────────────────
     def full_assignment(self, data):
-        labels = []
-        for point in data:
-            distances = [self.compute_distance(point, c)
-                         for c in self.centroids]
-            labels.append(np.argmin(distances))
-        return np.array(labels)
+        squared_distances = self.compute_squared_distances(data)
+        return np.argmin(squared_distances, axis=1)
 
     # ─── Update Centroids ─────────────────────────────────
     def update_centroids(self, data):
-        new_centroids = []
-        for i in range(self.k):
-            cluster_points = data[self.labels == i]
-            if len(cluster_points) == 0:
-                # keep old centroid if cluster is empty
-                new_centroids.append(self.centroids[i])
-            else:
-                new_centroids.append(cluster_points.mean(axis=0))
-        return np.array(new_centroids)
+        new_centroids = self.centroids.copy()
+        counts = np.bincount(self.labels, minlength=self.k)
+        non_empty = counts > 0
+
+        sums = np.zeros_like(self.centroids)
+        np.add.at(sums, self.labels, data)
+        new_centroids[non_empty] = sums[non_empty] / counts[non_empty, np.newaxis]
+
+        return new_centroids
 
     # ─── Compute Drift Per Centroid ───────────────────────
-    # Drift = how much each centroid moved this iteration.
-    # Used to determine which points are close enough to a
-    # boundary to possibly switch clusters.
     def compute_drift(self, old_centroids, new_centroids):
-        drift = np.array([
-            self.compute_distance(old_centroids[i], new_centroids[i])
-            for i in range(self.k)
-        ])
-        return drift
-
-    # ─── Find Active Points Using Drift ───────────────────
-    # A point needs rechecking only if it is close enough to
-    # its centroid boundary to potentially switch clusters.
-    # By the triangle inequality, if a centroid moved by delta,
-    # a point's distance to it can change by at most delta.
-    # So if dist(point, centroid) <= 2 * drift, the point
-    # is near the boundary and must be rechecked.
-    # Points deeper inside their cluster are provably stable
-    # and are skipped entirely.
-    def get_active_points(self, data, drift):
-        active = []
-        for idx, point in enumerate(data):
-            cluster = self.labels[idx]
-            dist_to_centroid = self.compute_distance(
-                point, self.centroids[cluster]
-            )
-            if dist_to_centroid <= 2 * drift[cluster] + self.epsilon:
-                active.append(idx)
-        return active
+        diffs = old_centroids - new_centroids
+        return np.sqrt(np.sum(diffs ** 2, axis=1))
 
     # ─── Compute SSE ──────────────────────────────────────
     def compute_sse(self, data):
-        sse = 0.0
-        for i in range(self.k):
-            cluster_points = data[self.labels == i]
-            for point in cluster_points:
-                sse += self.compute_distance(point, self.centroids[i]) ** 2
-        return sse
+        assigned_centroids = self.centroids[self.labels]
+        diffs = data - assigned_centroids
+        return float(np.sum(diffs ** 2))
 
     # ─── Main Fit ─────────────────────────────────────────
     def fit(self, data):
+        data = np.asarray(data, dtype=float)
 
-        # ── Phase 1: Range-Based ESPI Initialization ──────
-        # Place centroids evenly across the value range of
-        # the dominant variance dimension. O(n*d).
-        self.centroids = self.espi_init(data)
+        # Step 1: percentile-based initialization
+        self.centroids = self.percentile_init(data)
 
-        # ── Phase 2: Initial Full Assignment ──────────────
-        # All points assigned once from scratch. O(n*k*d).
+        # Step 2: initial full assignment
         self.labels = self.full_assignment(data)
 
-        # ── Phase 3: Iterative Loop with Drift Skipping ───
-        for iteration in range(self.max_iterations):
+        # Step 3: align centroids with the first assignment
+        self.centroids = self.update_centroids(data)
 
+        self.sse_history = []
+        self.drift_history = []
+        self.reassigned_history = []
+        self.n_iterations = 0
+
+        for _ in range(self.max_iterations):
             old_centroids = self.centroids.copy()
+            old_labels = self.labels.copy()
 
-            # Step 1: recompute centroids from current labels
+            # Step 4: assign every point to nearest centroid
+            self.labels = self.full_assignment(data)
+
+            # Count how many labels changed
+            reassigned = int(np.sum(self.labels != old_labels))
+
+            # Step 5: recompute centroids
             self.centroids = self.update_centroids(data)
 
-            # Step 2: compute how much each centroid moved
+            # Step 6: compute centroid drift
             drift = self.compute_drift(old_centroids, self.centroids)
+            max_drift = np.max(drift)
 
-            # Step 3: find only points near a cluster boundary
-            # skip points that are deep inside their cluster
-            active_indices = self.get_active_points(data, drift)
-
-            # Step 4: reassign only active (boundary) points
-            reassigned = 0
-            for idx in active_indices:
-                point = data[idx]
-                distances = [self.compute_distance(point, c)
-                             for c in self.centroids]
-                new_label = np.argmin(distances)
-                if new_label != self.labels[idx]:
-                    self.labels[idx] = new_label
-                    reassigned += 1
-
-            # track metrics for plotting
+            # Track metrics
             self.sse_history.append(self.compute_sse(data))
+            self.drift_history.append(max_drift)
             self.reassigned_history.append(reassigned)
             self.n_iterations += 1
 
-            # convergence: no point switched OR centroids barely moved
-            max_drift = np.max(drift)
+            # Step 7: stop if centroids barely move
             if reassigned == 0 or max_drift < self.epsilon:
                 break
 
         return self
 
-    # ─── Predict (for new points) ─────────────────────────
+    # ─── Predict ──────────────────────────────────────────
     def predict(self, data):
-        labels = []
-        for point in data:
-            distances = [self.compute_distance(point, c)
-                         for c in self.centroids]
-            labels.append(np.argmin(distances))
-        return np.array(labels)
+        data = np.asarray(data, dtype=float)
+        squared_distances = self.compute_squared_distances(data)
+        return np.argmin(squared_distances, axis=1)
