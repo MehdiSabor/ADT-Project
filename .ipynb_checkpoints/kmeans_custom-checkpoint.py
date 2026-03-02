@@ -1,12 +1,11 @@
 import numpy as np
 
-
 class KMeansCustom:
 
     def __init__(self, k, max_iterations=100, epsilon=1e-4):
         self.k = k
         self.max_iterations = max_iterations
-        self.epsilon = epsilon          # drift threshold for convergence
+        self.epsilon = epsilon        # drift threshold
         self.centroids = None
         self.labels = None
         self.sse_history = []
@@ -17,38 +16,27 @@ class KMeansCustom:
     def compute_distance(self, point, centroid):
         return np.sqrt(np.sum((point - centroid) ** 2))
 
-    # ─── ESPI Initialization (Range-Based) ───────────────
-    # Instead of sorting data points and taking partition means,
-    # we divide the actual value range [min, max] of the dominant
-    # dimension into k equal segments and place each centroid at
-    # the midpoint of its segment.
-    # For all other dimensions, centroids are placed at the global mean.
-    # This guarantees:
-    #   - Maximum spread along the most informative axis
-    #   - No two centroids can start at the same position
-    #   - O(n*d) time — no sorting needed
+    # ─── ESPI Initialization ──────────────────────────────
     def espi_init(self, data):
-        n, d = data.shape
-
         # Step 1: find dominant dimension (largest variance)
         variances = np.var(data, axis=0)
         dominant_dim = np.argmax(variances)
 
-        # Step 2: get range along dominant dimension
-        d_min = data[:, dominant_dim].min()
-        d_max = data[:, dominant_dim].max()
-        segment_width = (d_max - d_min) / self.k
+        # Step 2: sort points along dominant dimension
+        sorted_indices = np.argsort(data[:, dominant_dim])
+        sorted_data = data[sorted_indices]
 
-        # Step 3: global mean for all non-dominant dimensions
-        global_mean = data.mean(axis=0)
+        # Step 3: divide into k equal partitions
+        partitions = np.array_split(sorted_data, self.k)
 
-        # Step 4: place each centroid at midpoint of its segment
-        # on the dominant axis, global mean on all other axes
+        # Step 4: compute mean of each partition as centroid
         centroids = []
-        for j in range(self.k):
-            centroid = global_mean.copy()
-            centroid[dominant_dim] = d_min + (j + 0.5) * segment_width
-            centroids.append(centroid)
+        for partition in partitions:
+            if len(partition) == 0:
+                # if empty partition pick random point
+                centroids.append(data[np.random.randint(len(data))])
+            else:
+                centroids.append(partition.mean(axis=0))
 
         return np.array(centroids)
 
@@ -57,7 +45,7 @@ class KMeansCustom:
         labels = []
         for point in data:
             distances = [self.compute_distance(point, c)
-                         for c in self.centroids]
+                        for c in self.centroids]
             labels.append(np.argmin(distances))
         return np.array(labels)
 
@@ -67,107 +55,91 @@ class KMeansCustom:
         for i in range(self.k):
             cluster_points = data[self.labels == i]
             if len(cluster_points) == 0:
-                # keep old centroid if cluster is empty
                 new_centroids.append(self.centroids[i])
             else:
                 new_centroids.append(cluster_points.mean(axis=0))
         return np.array(new_centroids)
 
     # ─── Compute Drift Per Centroid ───────────────────────
-    # Drift = how much each centroid moved this iteration.
-    # Used to determine which points are close enough to a
-    # boundary to possibly switch clusters.
     def compute_drift(self, old_centroids, new_centroids):
-        drift = np.array([
-            self.compute_distance(old_centroids[i], new_centroids[i])
-            for i in range(self.k)
-        ])
-        return drift
+        # how much each centroid moved this iteration
+        drift = []
+        for i in range(self.k):
+            d = self.compute_distance(old_centroids[i], 
+                                      new_centroids[i])
+            drift.append(d)
+        return np.array(drift)
 
-    # ─── Find Active Points Using Drift ───────────────────
-    # A point needs rechecking only if it is close enough to
-    # its centroid boundary to potentially switch clusters.
-    # By the triangle inequality, if a centroid moved by delta,
-    # a point's distance to it can change by at most delta.
-    # So if dist(point, centroid) <= 2 * drift, the point
-    # is near the boundary and must be rechecked.
-    # Points deeper inside their cluster are provably stable
-    # and are skipped entirely.
+    # ─── Find Points To Check Using Drift ─────────────────
     def get_active_points(self, data, drift):
+        # a point is active (needs checking) if:
+        # its distance to centroid <= 2 * drift of that centroid
+        # meaning it MIGHT switch clusters
         active = []
         for idx, point in enumerate(data):
             cluster = self.labels[idx]
             dist_to_centroid = self.compute_distance(
                 point, self.centroids[cluster]
             )
+            # if point is close enough to boundary → check it
             if dist_to_centroid <= 2 * drift[cluster] + self.epsilon:
                 active.append(idx)
         return active
 
     # ─── Compute SSE ──────────────────────────────────────
     def compute_sse(self, data):
-        sse = 0.0
+        sse = 0
         for i in range(self.k):
             cluster_points = data[self.labels == i]
             for point in cluster_points:
-                sse += self.compute_distance(point, self.centroids[i]) ** 2
+                sse += self.compute_distance(
+                    point, self.centroids[i]) ** 2
         return sse
 
     # ─── Main Fit ─────────────────────────────────────────
     def fit(self, data):
 
-        # ── Phase 1: Range-Based ESPI Initialization ──────
-        # Place centroids evenly across the value range of
-        # the dominant variance dimension. O(n*d).
+        # ── Phase 1: ESPI Initialization ──────────────────
         self.centroids = self.espi_init(data)
 
         # ── Phase 2: Initial Full Assignment ──────────────
-        # All points assigned once from scratch. O(n*k*d).
         self.labels = self.full_assignment(data)
 
-        # ── Phase 3: Iterative Loop with Drift Skipping ───
+        # ── Phase 3: Iterative Loop ────────────────────────
         for iteration in range(self.max_iterations):
 
             old_centroids = self.centroids.copy()
 
-            # Step 1: recompute centroids from current labels
+            # Step 1: update centroids
             self.centroids = self.update_centroids(data)
 
             # Step 2: compute how much each centroid moved
-            drift = self.compute_drift(old_centroids, self.centroids)
+            drift = self.compute_drift(old_centroids, 
+                                       self.centroids)
 
-            # Step 3: find only points near a cluster boundary
-            # skip points that are deep inside their cluster
+            # Step 3: find only points that might switch
+            # skip points deep inside their cluster
             active_indices = self.get_active_points(data, drift)
 
-            # Step 4: reassign only active (boundary) points
+            # Step 4: reassign only active points
             reassigned = 0
             for idx in active_indices:
                 point = data[idx]
                 distances = [self.compute_distance(point, c)
-                             for c in self.centroids]
+                            for c in self.centroids]
                 new_label = np.argmin(distances)
                 if new_label != self.labels[idx]:
                     self.labels[idx] = new_label
                     reassigned += 1
 
-            # track metrics for plotting
+            # track metrics
             self.sse_history.append(self.compute_sse(data))
             self.reassigned_history.append(reassigned)
             self.n_iterations += 1
 
-            # convergence: no point switched OR centroids barely moved
+            # convergence: nothing moved or centroids stable
             max_drift = np.max(drift)
             if reassigned == 0 or max_drift < self.epsilon:
                 break
 
         return self
-
-    # ─── Predict (for new points) ─────────────────────────
-    def predict(self, data):
-        labels = []
-        for point in data:
-            distances = [self.compute_distance(point, c)
-                         for c in self.centroids]
-            labels.append(np.argmin(distances))
-        return np.array(labels)
