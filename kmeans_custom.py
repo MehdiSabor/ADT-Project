@@ -2,7 +2,7 @@
 Custom K-Means implementation with deterministic percentile-based initialization.
 
 This module implements a variant of K-Means that uses:
-  - ESPI-style initialization: centroids are placed along the dimension with
+  - SPI-style initialization: centroids are placed along the dimension with
     highest variance, spaced between low and high percentiles (e.g., 5th–95th).
   - Full reassignment every iteration (standard assign-then-update loop).
   - Stopping when no points change cluster or maximum centroid drift is below
@@ -17,7 +17,7 @@ import numpy as np
 
 class KMeansCustom:
     """
-    K-Means with percentile-based (ESPI) initialization and drift-based stopping.
+    K-Means with percentile-based (SPI) initialization and drift-based stopping.
 
     Attributes:
         k (int): Number of clusters.
@@ -99,7 +99,7 @@ class KMeansCustom:
     # ─── Percentile Initialization Across All Features ───
     def percentile_init(self, data):
         """
-        Initialize centroids using the dominant-axis percentile (ESPI) strategy.
+        Initialize centroids using the dominant-axis percentile (SPI) strategy.
 
         Finds the feature dimension with maximum variance, then places k
         centroids at evenly spaced positions between the low and high
